@@ -1,6 +1,6 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MapContainer, TileLayer, Marker, Polyline, useMapEvents } from "react-leaflet";
-import L, { type LatLngExpression } from "leaflet";
+import L, { type LatLngExpression, type LeafletMouseEvent, type Map as LeafletMap } from "leaflet";
 import { motion, AnimatePresence } from "framer-motion";
 import "leaflet/dist/leaflet.css";
 import "./App.css";
@@ -81,9 +81,13 @@ function formatClock(ms: number) {
   return `${hh}:${mm}:${ss}`;
 }
 
+function toLatLngExpression(point: LatLngLike): LatLngExpression {
+  return [point.lat, point.lng] as [number, number];
+}
+
 function ClickCatcher({ onPick }: { onPick: (latlng: LatLngLike) => void }) {
   useMapEvents({
-    click(e) {
+    click(e: LeafletMouseEvent) {
       onPick({ lat: e.latlng.lat, lng: e.latlng.lng });
     },
   });
@@ -107,7 +111,7 @@ export default function App() {
   const [arrived, setArrived] = useState(false);
 
   const animRef = useRef<number | null>(null);
-  const mapRef = useRef<L.Map | null>(null);
+  const mapRef = useRef<LeafletMap | null>(null);
 
   const planRoute = useCallback(async () => {
     if (!start || !end) {
@@ -188,6 +192,26 @@ export default function App() {
   const traveledMeters = useMemo(() => totalMeters * progress, [totalMeters, progress]);
   const totalKm = useMemo(() => (totalMeters / 1000).toFixed(2), [totalMeters]);
   const traveledKm = useMemo(() => (traveledMeters / 1000).toFixed(2), [traveledMeters]);
+
+  const mapCenter = useMemo<LatLngExpression>(() => {
+    return start ? toLatLngExpression(start) : toLatLngExpression(DEFAULT_CENTER);
+  }, [start]);
+  const startPosition = useMemo<LatLngExpression | null>(
+    () => (start ? toLatLngExpression(start) : null),
+    [start],
+  );
+  const endPosition = useMemo<LatLngExpression | null>(() => (end ? toLatLngExpression(end) : null), [end]);
+  const carPosition = useMemo<LatLngExpression | null>(() => (carPos ? toLatLngExpression(carPos) : null), [carPos]);
+  const routePositions = useMemo<LatLngExpression[]>(
+    () => routePath.map((point) => toLatLngExpression(point)),
+    [routePath],
+  );
+
+  const handleMapInstance = useCallback((instance: LeafletMap | null) => {
+    if (!instance) return;
+    mapRef.current = instance;
+    requestAnimationFrame(() => instance.invalidateSize());
+  }, []);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -345,28 +369,25 @@ export default function App() {
         <div className="map-panel">
           <div className="map-wrapper">
             <MapContainer
-              center={start ?? DEFAULT_CENTER}
+              center={mapCenter}
               zoom={13}
               className="map-canvas"
               scrollWheelZoom
-              whenCreated={(mapInstance) => {
-                mapRef.current = mapInstance;
-                requestAnimationFrame(() => mapInstance.invalidateSize());
-              }}
+              ref={handleMapInstance}
             >
               <TileLayer
                 attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> contributors'
                 url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
               />
-              {start && <Marker position={start} icon={startIcon} />}
-              {end && <Marker position={end} icon={endIcon} />}
-              {routePath.length > 0 && (
+              {startPosition && <Marker position={startPosition} icon={startIcon} />}
+              {endPosition && <Marker position={endPosition} icon={endIcon} />}
+              {routePositions.length > 0 && (
                 <Polyline
                   pathOptions={{ weight: 6, opacity: 0.9 }}
-                  positions={routePath.map((p) => [p.lat, p.lng]) as LatLngExpression[]}
+                  positions={routePositions}
                 />
               )}
-              {carPos && <Marker position={carPos} icon={carIcon} />}
+              {carPosition && <Marker position={carPosition} icon={carIcon} />}
               {(mode === "setStart" || mode === "setEnd") && (
                 <ClickCatcher
                   onPick={(point) => {
