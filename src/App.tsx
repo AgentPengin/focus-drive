@@ -1,26 +1,35 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { MapContainer, TileLayer, Marker, Polyline, useMapEvents } from "react-leaflet";
-import L, { type LatLngExpression, type LeafletMouseEvent, type Map as LeafletMap } from "leaflet";
+import Map, { Layer, Marker, NavigationControl, Source } from "react-map-gl/maplibre";
+import type { LayerProps, MapLayerMouseEvent, MapRef } from "react-map-gl/maplibre";
+import maplibregl from "maplibre-gl";
 import { motion, AnimatePresence } from "framer-motion";
-import "leaflet/dist/leaflet.css";
 import "./App.css";
-
-// Fix Leaflet default marker paths under bundlers (Vite/CRA)
-import marker2x from "leaflet/dist/images/marker-icon-2x.png";
-import marker from "leaflet/dist/images/marker-icon.png";
-import shadow from "leaflet/dist/images/marker-shadow.png";
-L.Icon.Default.mergeOptions({ iconUrl: marker, iconRetinaUrl: marker2x, shadowUrl: shadow });
 
 interface LatLngLike {
   lat: number;
   lng: number;
 }
 
+type CoordTuple = [number, number]; // [lng, lat]
+
 const DEFAULT_CENTER: LatLngLike = { lat: 21.0278, lng: 105.8342 };
 const DEFAULT_STATUS = "Chọn điểm xuất phát và điểm đến để lập lộ trình.";
-const START_MARKER_HTML = "<span class='fd-marker__pin'><span class='fd-marker__glyph'>GO</span><span class='fd-marker__tail'></span></span>";
-const END_MARKER_HTML = "<span class='fd-marker__pin'><span class='fd-marker__glyph'>🏁</span><span class='fd-marker__tail'></span></span>";
-const CAR_MARKER_HTML = "<span class='fd-marker__pin'><span class='fd-marker__glyph'>🚗</span></span>";
+const MAP_STYLE_URL = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json";
+const MAP_FOLLOW_PITCH = 55;
+
+const ROUTE_LINE_LAYER: LayerProps = {
+  id: "route-line",
+  type: "line",
+  layout: {
+    "line-cap": "round",
+    "line-join": "round",
+  },
+  paint: {
+    "line-color": "#111827",
+    "line-width": 5,
+    "line-opacity": 0.85,
+  },
+};
 
 function haversine(a: LatLngLike, b: LatLngLike) {
   const R = 6371e3;
@@ -81,17 +90,64 @@ function formatClock(ms: number) {
   return `${hh}:${mm}:${ss}`;
 }
 
-function toLatLngExpression(point: LatLngLike): LatLngExpression {
-  return [point.lat, point.lng] as [number, number];
+function toCoordTuple(point: LatLngLike): CoordTuple {
+  return [point.lng, point.lat];
 }
 
-function ClickCatcher({ onPick }: { onPick: (latlng: LatLngLike) => void }) {
-  useMapEvents({
-    click(e: LeafletMouseEvent) {
-      onPick({ lat: e.latlng.lat, lng: e.latlng.lng });
-    },
-  });
-  return null;
+function bearingDegrees(from: LatLngLike, to: LatLngLike): number {
+  const φ1 = (from.lat * Math.PI) / 180;
+  const φ2 = (to.lat * Math.PI) / 180;
+  const Δλ = ((to.lng - from.lng) * Math.PI) / 180;
+  const y = Math.sin(Δλ) * Math.cos(φ2);
+  const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+  const θ = Math.atan2(y, x);
+  const deg = (θ * 180) / Math.PI;
+  return (deg + 360) % 360;
+}
+
+function headingAlongPath(path: LatLngLike[], fraction: number): number | null {
+  if (path.length < 2) return null;
+  const total = pathLengthMeters(path);
+  if (total === 0) return null;
+  const clampedFraction = Math.min(1, Math.max(0, fraction));
+  const target = total * clampedFraction;
+  let acc = 0;
+  for (let i = 1; i < path.length; i++) {
+    const seg = haversine(path[i - 1], path[i]);
+    if (seg === 0) continue;
+    if (acc + seg >= target) {
+      return bearingDegrees(path[i - 1], path[i]);
+    }
+    acc += seg;
+  }
+  return bearingDegrees(path[path.length - 2], path[path.length - 1]);
+}
+
+function boundsFromCoords(coords: CoordTuple[]): maplibregl.LngLatBounds | null {
+  if (!coords.length) return null;
+  const bounds = coords.reduce(
+    (b, coord) => b.extend(coord),
+    new maplibregl.LngLatBounds(coords[0], coords[0]),
+  );
+  return bounds;
+}
+
+interface MarkerProps {
+  glyph: string;
+  variant: "start" | "end" | "car";
+  rotationDeg?: number;
+}
+
+function MarkerPin({ glyph, variant, rotationDeg = 0 }: MarkerProps) {
+  const pinStyle = rotationDeg ? { transform: `rotate(${rotationDeg}deg)` } : undefined;
+  return (
+    <div className={`fd-marker fd-marker--${variant}`}>
+      <span className="fd-marker__pin" style={pinStyle}>
+        <span className="fd-marker__glyph">{glyph}</span>
+        {variant !== "car" && <span className="fd-marker__tail" />}
+      </span>
+    </div>
+  );
 }
 
 export default function App() {
@@ -101,17 +157,17 @@ export default function App() {
 
   const [mode, setMode] = useState<"idle" | "setStart" | "setEnd">("setStart");
   const [useOsrm, setUseOsrm] = useState(false);
-  const [isPlanningRoute, setIsPlanningRoute] = useState(false);
-  const [statusMessage, setStatusMessage] = useState(DEFAULT_STATUS);
 
   const [durationMin, setDurationMin] = useState(25);
   const [isRunning, setIsRunning] = useState(false);
   const [startTime, setStartTime] = useState<number | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [arrived, setArrived] = useState(false);
+  const [statusMessage, setStatusMessage] = useState(DEFAULT_STATUS);
+  const [isPlanningRoute, setIsPlanningRoute] = useState(false);
 
   const animRef = useRef<number | null>(null);
-  const mapRef = useRef<LeafletMap | null>(null);
+  const mapRef = useRef<MapRef | null>(null);
 
   const planRoute = useCallback(async () => {
     if (!start || !end) {
@@ -192,81 +248,77 @@ export default function App() {
   const traveledMeters = useMemo(() => totalMeters * progress, [totalMeters, progress]);
   const totalKm = useMemo(() => (totalMeters / 1000).toFixed(2), [totalMeters]);
   const traveledKm = useMemo(() => (traveledMeters / 1000).toFixed(2), [traveledMeters]);
+  const headingDeg = useMemo(() => headingAlongPath(routePath, progress), [routePath, progress]);
 
-  const mapCenter = useMemo<LatLngExpression>(() => {
-    return start ? toLatLngExpression(start) : toLatLngExpression(DEFAULT_CENTER);
-  }, [start]);
-  const startPosition = useMemo<LatLngExpression | null>(
-    () => (start ? toLatLngExpression(start) : null),
-    [start],
-  );
-  const endPosition = useMemo<LatLngExpression | null>(() => (end ? toLatLngExpression(end) : null), [end]);
-  const carPosition = useMemo<LatLngExpression | null>(() => (carPos ? toLatLngExpression(carPos) : null), [carPos]);
-  const routePositions = useMemo<LatLngExpression[]>(
-    () => routePath.map((point) => toLatLngExpression(point)),
-    [routePath],
-  );
+  const startCoord = useMemo<CoordTuple | null>(() => (start ? toCoordTuple(start) : null), [start]);
+  const endCoord = useMemo<CoordTuple | null>(() => (end ? toCoordTuple(end) : null), [end]);
+  const carCoord = useMemo<CoordTuple | null>(() => (carPos ? toCoordTuple(carPos) : null), [carPos]);
+  const routeCoords = useMemo<CoordTuple[]>(() => routePath.map((point) => toCoordTuple(point)), [routePath]);
+  const routeGeoJson = useMemo(() => {
+    if (routeCoords.length < 2) return null;
+    return {
+      type: "Feature" as const,
+      geometry: {
+        type: "LineString" as const,
+        coordinates: routeCoords,
+      },
+      properties: {},
+    };
+  }, [routeCoords]);
 
-  const handleMapInstance = useCallback((instance: LeafletMap | null) => {
-    if (!instance) return;
-    mapRef.current = instance;
-    requestAnimationFrame(() => instance.invalidateSize());
-  }, []);
+  const activeHeadingDeg = useMemo(() => (isRunning && headingDeg != null ? headingDeg : 0), [isRunning, headingDeg]);
+  const carMarkerRotation = useMemo(() => (isRunning ? 0 : headingDeg ?? 0), [isRunning, headingDeg]);
 
   useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
-    if (!routePath.length) return;
+    const mapInstance = mapRef.current?.getMap();
+    if (!mapInstance) return;
+    if (!routeCoords.length) return;
     if (isRunning) return;
-    if (routePath.length === 1) {
-      map.setView(routePath[0], map.getZoom(), { animate: true });
+
+    if (routeCoords.length === 1) {
+      mapInstance.easeTo({
+        center: routeCoords[0],
+        zoom: 14,
+        bearing: 0,
+        pitch: 0,
+        duration: 800,
+      });
       return;
     }
-    const bounds = L.latLngBounds(routePath.map((p) => [p.lat, p.lng] as [number, number]));
-    map.fitBounds(bounds, { padding: [72, 72], maxZoom: 16 });
-  }, [routePath, isRunning]);
+
+    const bounds = boundsFromCoords(routeCoords);
+    if (bounds) {
+      mapInstance.fitBounds(bounds, {
+        padding: 120,
+        duration: 900,
+        maxZoom: 16,
+      });
+      mapInstance.easeTo({ bearing: 0, pitch: 0, duration: 1 });
+    }
+  }, [routeCoords, isRunning]);
 
   useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
-    if (!carPos) return;
-    if (!isRunning) return;
-    map.panTo([carPos.lat, carPos.lng], { animate: true, duration: 0.6, easeLinearity: 0.25 });
-  }, [carPos, isRunning]);
+    const mapInstance = mapRef.current?.getMap();
+    if (!mapInstance) return;
+    if (!isRunning) {
+      if (mapInstance.getPitch() !== 0 || mapInstance.getBearing() !== 0) {
+        mapInstance.easeTo({ bearing: 0, pitch: 0, duration: 600 });
+      }
+      return;
+    }
+    if (!carCoord) return;
 
-  const startIcon = useMemo(
-    () =>
-      L.divIcon({
-        className: "leaflet-div-icon fd-marker fd-marker--start",
-        html: START_MARKER_HTML,
-        iconSize: [48, 58],
-        iconAnchor: [24, 52],
-      }),
-    [],
-  );
-  const endIcon = useMemo(
-    () =>
-      L.divIcon({
-        className: "leaflet-div-icon fd-marker fd-marker--end",
-        html: END_MARKER_HTML,
-        iconSize: [48, 58],
-        iconAnchor: [24, 52],
-      }),
-    [],
-  );
-  const carIcon = useMemo(
-    () =>
-      L.divIcon({
-        className: "leaflet-div-icon fd-marker fd-marker--car",
-        html: CAR_MARKER_HTML,
-        iconSize: [44, 44],
-        iconAnchor: [22, 22],
-      }),
-    [],
-  );
+    mapInstance.easeTo({
+      center: carCoord,
+      bearing: activeHeadingDeg,
+      pitch: MAP_FOLLOW_PITCH,
+      duration: 600,
+      easing: (t) => 1 - Math.pow(1 - t, 3),
+    });
+  }, [carCoord, activeHeadingDeg, isRunning]);
 
   const canStart = routePath.length > 0 && !isRunning && !isPlanningRoute;
-  const canPlan = !!start && !!end && !isPlanningRoute;
+  const canPlan = Boolean(start && end && !isPlanningRoute);
 
   const interactionMessage = useMemo(() => {
     if (mode === "setStart") return "Click trên bản đồ để chọn điểm xuất phát.";
@@ -316,8 +368,15 @@ export default function App() {
     setStartTime(null);
     setArrived(false);
     handleSetMode("setStart");
-    mapRef.current?.setView(DEFAULT_CENTER, 13, { animate: true });
     setStatusMessage(DEFAULT_STATUS);
+    const mapInstance = mapRef.current?.getMap();
+    mapInstance?.easeTo({
+      center: toCoordTuple(DEFAULT_CENTER),
+      zoom: 13,
+      bearing: 0,
+      pitch: 0,
+      duration: 800,
+    });
   }, [handleSetMode]);
 
   const handleStartSession = useCallback(() => {
@@ -345,6 +404,18 @@ export default function App() {
     setDurationMin(Math.min(240, Math.round(value)));
   }, []);
 
+  const handleMapClick = useCallback(
+    (event: MapLayerMouseEvent) => {
+      const point = { lat: event.lngLat.lat, lng: event.lngLat.lng };
+      if (mode === "setStart") {
+        handleSelectStart(point);
+      } else if (mode === "setEnd") {
+        handleSelectEnd(point);
+      }
+    },
+    [mode, handleSelectStart, handleSelectEnd],
+  );
+
   return (
     <div className="app-shell">
       <header className="app-header">
@@ -356,9 +427,7 @@ export default function App() {
           </div>
         </div>
         <div className="session-meta">
-          <div
-            className={`session-chip ${arrived ? "chip-arrived" : isRunning ? "chip-running" : "chip-idle"}`}
-          >
+          <div className={`session-chip ${arrived ? "chip-arrived" : isRunning ? "chip-running" : "chip-idle"}`}>
             {arrived ? "Đã đến đích" : isRunning ? "Đang tập trung" : "Đang tạm dừng"}
           </div>
           <div className="session-clock">{formatClock(remainingMs)}</div>
@@ -368,35 +437,45 @@ export default function App() {
       <div className="app-body">
         <div className="map-panel">
           <div className="map-wrapper">
-            <MapContainer
-              center={mapCenter}
-              zoom={13}
-              className="map-canvas"
-              scrollWheelZoom
-              ref={handleMapInstance}
+            <Map
+              ref={(instance) => {
+                mapRef.current = instance;
+              }}
+              mapLib={maplibregl}
+              mapStyle={MAP_STYLE_URL}
+              style={{ width: "100%", height: "100%" }}
+              attributionControl={false}
+              onClick={handleMapClick}
+              initialViewState={{
+                longitude: DEFAULT_CENTER.lng,
+                latitude: DEFAULT_CENTER.lat,
+                zoom: 13,
+                pitch: 0,
+                bearing: 0,
+              }}
             >
-              <TileLayer
-                attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> contributors'
-                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-              />
-              {startPosition && <Marker position={startPosition} icon={startIcon} />}
-              {endPosition && <Marker position={endPosition} icon={endIcon} />}
-              {routePositions.length > 0 && (
-                <Polyline
-                  pathOptions={{ weight: 6, opacity: 0.9 }}
-                  positions={routePositions}
-                />
+              <NavigationControl position="bottom-right" visualizePitch />
+              {routeGeoJson && (
+                <Source id="route" type="geojson" data={routeGeoJson}>
+                  <Layer {...ROUTE_LINE_LAYER} />
+                </Source>
               )}
-              {carPosition && <Marker position={carPosition} icon={carIcon} />}
-              {(mode === "setStart" || mode === "setEnd") && (
-                <ClickCatcher
-                  onPick={(point) => {
-                    if (mode === "setStart") handleSelectStart(point);
-                    else handleSelectEnd(point);
-                  }}
-                />
+              {startCoord && (
+                <Marker longitude={startCoord[0]} latitude={startCoord[1]} anchor="bottom">
+                  <MarkerPin glyph="GO" variant="start" />
+                </Marker>
               )}
-            </MapContainer>
+              {endCoord && (
+                <Marker longitude={endCoord[0]} latitude={endCoord[1]} anchor="bottom">
+                  <MarkerPin glyph="🏁" variant="end" />
+                </Marker>
+              )}
+              {carCoord && (
+                <Marker longitude={carCoord[0]} latitude={carCoord[1]} anchor="center">
+                  <MarkerPin glyph="🚗" variant="car" rotationDeg={carMarkerRotation} />
+                </Marker>
+              )}
+            </Map>
             <div className="map-overlay">
               <span>{interactionMessage}</span>
             </div>
@@ -440,7 +519,9 @@ export default function App() {
                 <button className="primary" disabled={!canPlan} onClick={planRoute}>
                   {isPlanningRoute ? "Đang lập..." : "Lập lộ trình"}
                 </button>
-                <button className="ghost" onClick={handleClearRoute}>Xoá lộ trình</button>
+                <button className="ghost" onClick={handleClearRoute}>
+                  Xoá lộ trình
+                </button>
               </div>
             </div>
 
@@ -513,8 +594,12 @@ export default function App() {
               <button className="primary" disabled={!canStart} onClick={handleStartSession}>
                 Bắt đầu
               </button>
-              <button className="ghost" onClick={handlePauseSession}>Tạm dừng</button>
-              <button className="ghost" onClick={handleResetSession}>Đặt lại</button>
+              <button className="ghost" onClick={handlePauseSession}>
+                Tạm dừng
+              </button>
+              <button className="ghost" onClick={handleResetSession}>
+                Đặt lại
+              </button>
             </div>
 
             <AnimatePresence>
