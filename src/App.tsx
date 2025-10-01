@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Map, { Layer, Marker, NavigationControl, Source } from "react-map-gl/maplibre";
-import type { LayerProps, MapLayerMouseEvent, MapRef } from "react-map-gl/maplibre";
+import type { MapLayerMouseEvent, MapRef } from "react-map-gl/maplibre";
 import maplibregl from "maplibre-gl";
 import { motion, AnimatePresence } from "framer-motion";
 import "./App.css";
@@ -17,19 +17,6 @@ const DEFAULT_STATUS = "Chọn điểm xuất phát và điểm đến để l�
 const MAP_STYLE_URL = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json";
 const MAP_FOLLOW_PITCH = 55;
 
-const ROUTE_LINE_LAYER: LayerProps = {
-  id: "route-line",
-  type: "line",
-  layout: {
-    "line-cap": "round",
-    "line-join": "round",
-  },
-  paint: {
-    "line-color": "#111827",
-    "line-width": 5,
-    "line-opacity": 0.85,
-  },
-};
 
 function haversine(a: LatLngLike, b: LatLngLike) {
   const R = 6371e3;
@@ -139,12 +126,24 @@ interface MarkerProps {
 }
 
 function MarkerPin({ glyph, variant, rotationDeg = 0 }: MarkerProps) {
+  if (variant === "car") {
+    return (
+      <div className="fd-car-marker">
+        <img
+          src="/arrow2.png"
+          alt="car"
+          className="fd-car-image"
+          style={{ transform: `rotate(${rotationDeg}deg)` }}
+        />
+      </div>
+    );
+  }
   const pinStyle = rotationDeg ? { transform: `rotate(${rotationDeg}deg)` } : undefined;
   return (
     <div className={`fd-marker fd-marker--${variant}`}>
       <span className="fd-marker__pin" style={pinStyle}>
         <span className="fd-marker__glyph">{glyph}</span>
-        {variant !== "car" && <span className="fd-marker__tail" />}
+        <span className="fd-marker__tail" />
       </span>
     </div>
   );
@@ -456,8 +455,22 @@ export default function App() {
             >
               <NavigationControl position="bottom-right" visualizePitch />
               {routeGeoJson && (
-                <Source id="route" type="geojson" data={routeGeoJson}>
-                  <Layer {...ROUTE_LINE_LAYER} />
+                <Source id="route" type="geojson" data={routeGeoJson} lineMetrics>
+                  <Layer
+                    id="route-line"
+                    type="line"
+                    layout={{ "line-cap": "round", "line-join": "round" }}
+                    paint={{
+                      "line-color": [
+                        "case",
+                        ["<=", ["line-progress"], progress],
+                        "#ef4444",
+                        "#111827",
+                      ],
+                      "line-width": 5,
+                      "line-opacity": 0.85,
+                    }}
+                  />
                 </Source>
               )}
               {startCoord && (

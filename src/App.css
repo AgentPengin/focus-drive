@@ -614,6 +614,23 @@
 .fd-marker--end .fd-marker__glyph {
   font-size: 1.05rem;
 }
+
+.fd-car-marker {
+  width: 48px;
+  height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.fd-car-image {
+  width: 40px;
+  height: 40px;
+  transform-origin: 50% 50%;
+  transition: transform 0.35s ease;
+  filter: drop-shadow(0 8px 18px rgba(15, 23, 42, 0.25));
+}
 @media (max-width: 720px) {
   .app-header {
     flex-direction: column;
